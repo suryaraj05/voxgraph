@@ -8,6 +8,8 @@ from pathlib import Path
 
 import websockets
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 TTS_SAMPLE_RATE = 24000
@@ -72,7 +74,7 @@ async def receive_tts_live(ws, out_wav: Path, max_wait_s: float, live_play: bool
         audio_stream.close()
 
     if not chunks:
-        server_wav = Path(__file__).resolve().parent / "last_response.wav"
+        server_wav = REPO_ROOT / "last_response.wav"
         if server_wav.exists():
             print(f"No WS audio; play server file: start {server_wav}")
         return 0
@@ -121,13 +123,17 @@ async def send_pcm(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("pcm_file", type=Path)
+    parser = argparse.ArgumentParser(description="Stream PCM to VoxGraph and receive TTS.")
+    parser.add_argument("pcm_file", type=Path, help="Raw linear16 mono 16 kHz PCM file")
     parser.add_argument("--url", default="ws://127.0.0.1:8000/audio")
     parser.add_argument("--chunk-size", type=int, default=4096)
     parser.add_argument("--trailing-silence", type=float, default=0.6)
     parser.add_argument("--max-wait", type=float, default=90.0)
-    parser.add_argument("--tts-out", type=Path, default=Path("response_tts.wav"))
+    parser.add_argument(
+        "--tts-out",
+        type=Path,
+        default=REPO_ROOT / "response_tts.wav",
+    )
     parser.add_argument("--no-live-play", action="store_true")
     args = parser.parse_args()
     asyncio.run(
