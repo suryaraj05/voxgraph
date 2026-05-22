@@ -6,16 +6,51 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 .venv/
 venv/
+.Python
 
-# Local test logs
+# Audio & media (generate locally with scripts/wav_to_pcm.py)
+*.pcm
+*.wav
+*.raw
+*.mp3
+*.flac
+*.ogg
+
+# Generated TTS / test outputs
+last_response.*
+response_tts.*
+*_tts.*
+
+# Logs & local debug artifacts
+*.log
+*.txt.err
 server_log.txt
-stt_test_log.txt
-stt_test_log.txt.err
-test_server_out.txt
-test_server_err.txt
-last_response.wav
-last_response.mp3
-response_tts.wav
-response_tts.mp3
+stt_test_log*
+test_server_*
+
+# Binaries & downloaded tools
+*.exe
+*.dll
+websocat*
+
+# Local experiments (keep on disk if you want; do not commit)
+graph.py
+diagnose_audio.py
+raw_convert.py
+testing_sine.py
+test_fastapi.py
+test_ws.py
+run_stt_test.ps1
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
