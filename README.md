@@ -97,35 +97,35 @@ sequenceDiagram
     participant G as Gemini
     participant E as ElevenLabs
 
-    loop While user speaks
-        C->>V: PCM chunks (4096 B)
-        V->>D: send_media(audio)
-        D-->>V: interim Results (is_final=false)
+    loop User speaking
+        C->>V: PCM chunks
+        V->>D: send_media
+        D-->>V: interim transcript
     end
 
     D-->>V: speech_final segment
-    Note over V: Append segment; start debounce timer
+    Note over V: Append segment and start debounce
 
-    loop Until UTTERANCE_DEBOUNCE_SEC silence
-        C->>V: optional more audio / segments
+    loop Debounce silence window
+        C->>V: more audio or segments
         V->>D: send_media
-        D-->>V: more speech_final segments
+        D-->>V: more speech_final
     end
 
-    Note over V: Merge segments → one prompt
+    Note over V: Merge segments into one prompt
 
-    V->>G: generate_content_stream(prompt)
-    V->>E: WebSocket connect (stream-input)
+    V->>G: generate_content_stream
+    V->>E: WebSocket connect
 
-    par Token streaming
+    par Stream response
         G-->>V: LLM tokens
-        V->>E: send JSON text chunks
-        E-->>V: JSON with base64 audio
-        V->>C: send_bytes (live PCM)
+        V->>E: text chunks
+        E-->>V: base64 audio JSON
+        V->>C: live PCM bytes
     end
 
-    V->>V: Save last_response.wav
-    Note over V: keepalive to Deepgram during LLM+TTS
+    V->>V: save last_response.wav
+    Note over V: Deepgram keepalive during LLM and TTS
 ```
 
 ### Utterance merge and debounce
@@ -137,19 +137,19 @@ flowchart TD
     A[Deepgram: is_final + speech_final] --> B{Transcript empty?}
     B -->|Yes| Z[Wait for more audio]
     B -->|No| C[Append to utterance_buffer]
-    C --> D[Join buffer → segment text]
+    C --> D[Join buffer to segment text]
     D --> E[Push to pending_transcript_parts]
     E --> F[Schedule debounce task]
     F --> G{No new audio for N seconds?}
     G -->|No| H[Reset timer on new PCM]
     H --> G
-    G -->|Yes| I["Merge parts: 'seg1 seg2 ...'"]
+    G -->|Yes| I[Merge parts into one question]
     I --> J{Same as last LLM prompt?}
     J -->|Yes| Z
     J -->|No| K[Cancel in-flight LLM/TTS task]
     K --> L[memory_retrieval_node]
     L --> M[Gemini stream]
-    M --> N[ElevenLabs stream → client]
+    M --> N[ElevenLabs stream to client]
 
     O[Client disconnect] --> P[finalize Deepgram]
     P --> Q[flush pending transcript]
