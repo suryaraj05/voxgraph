@@ -56,8 +56,8 @@ def main() -> None:
     parser.add_argument(
         "--post-send-wait",
         type=float,
-        default=1.5,
-        help="Seconds to keep websocket open after last chunk",
+        default=8.0,
+        help="Seconds to keep websocket open after last chunk (for LLM+TTS reply)",
     )
     args = parser.parse_args()
     asyncio.run(

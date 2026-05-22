@@ -2,7 +2,8 @@ import asyncio
 import json
 import os
 import ssl
-from typing import List
+import time
+from typing import List, Optional
 
 import logging
 import websockets
@@ -23,6 +24,15 @@ load_dotenv()  # loads variables from .env into os.environ
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai = genai_client.Client(api_key=GOOGLE_API_KEY)
 
+# gemini-2.5-flash-latest is NOT a valid API id (404). Use one of these:
+#   gemini-flash-latest  — auto-updates to newest Flash (what worked in your logs)
+#   gemini-2.5-flash     — stable production model
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL_FALLBACKS = (
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+)
+
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -30,7 +40,7 @@ VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # Adam voice
 
 ELEVENLABS_URL = (
     f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input"
-    f"?model_id=eleven_multilingual_v2&api_key={ELEVENLABS_API_KEY}"
+    f"?model_id=eleven_multilingual_v2"
 )
 
 # -------------------- LangGraph State --------------------
@@ -64,7 +74,7 @@ Past context: {state['episodic_summary']}
 User said: {state['transcript']}
 """
     response = genai.models.generate_content(
-        model="gemini-2.5-flash-latest",
+        model=GEMINI_MODEL,
         contents=prompt,
     )
     llm_response = response.text
@@ -72,18 +82,55 @@ User said: {state['transcript']}
     return {"llm_response": llm_response, "needs_tool": needs_tool}
 
 # -------------------- Streaming LLM (yields tokens) --------------------
+def _gemini_models_to_try() -> List[str]:
+    ordered = [GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS]
+    seen = set()
+    unique = []
+    for name in ordered:
+        if name and name not in seen:
+            seen.add(name)
+            unique.append(name)
+    return unique
+
+
+def _chunk_text(chunk) -> str:
+    text = getattr(chunk, "text", None)
+    if text:
+        return text
+    candidates = getattr(chunk, "candidates", None) or []
+    if not candidates:
+        return ""
+    content = getattr(candidates[0], "content", None)
+    parts = getattr(content, "parts", None) or []
+    return "".join(getattr(part, "text", "") or "" for part in parts)
+
+
 async def llm_stream(transcript: str, semantic_facts: List[str], episodic_summary: str):
     prompt = f"""
 You are VoxGraph, a voice AI assistant.
 User Transcript: {transcript}
 Semantic Facts: {semantic_facts}
 Episodic Summary: {episodic_summary}
+Reply in one or two short sentences suitable for voice output.
 """
-    for chunk in genai.models.generate_content_stream(
-        model="gemini-2.5-flash-latest",
-        contents=prompt,
-    ):
-        yield chunk.text
+    last_error: Optional[Exception] = None
+    for model in _gemini_models_to_try():
+        print(f"Calling Gemini ({model})...")
+        try:
+            stream = await genai.aio.models.generate_content_stream(
+                model=model,
+                contents=prompt,
+            )
+            async for chunk in stream:
+                token = _chunk_text(chunk)
+                if token:
+                    yield token
+            return
+        except Exception as exc:
+            last_error = exc
+            print(f"Gemini ({model}) failed: {exc}")
+    if last_error:
+        raise last_error
 
 
 async def logging_llm_stream(transcript: str, semantic_facts: List[str], episodic_summary: str):
@@ -103,7 +150,14 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("websockets").setLevel(logging.WARNING)
 
 async def tts_stream(token_stream, client_websocket: WebSocket):
-    async with websockets.connect(ELEVENLABS_URL) as ws:
+    if not ELEVENLABS_API_KEY:
+        print("ELEVENLABS_API_KEY not set — skipping TTS, LLM text only")
+        async for _token in token_stream:
+            pass
+        return
+
+    headers = {"xi-api-key": ELEVENLABS_API_KEY}
+    async with websockets.connect(ELEVENLABS_URL, additional_headers=headers) as ws:
         # Initialize stream
         await ws.send(json.dumps({
             "text": " ",
@@ -127,8 +181,13 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
                     print("TTS audio chunk received")
                 try:
                     await client_websocket.send_bytes(audio)
-                except (websockets.exceptions.ConnectionClosedError, ConnectionResetError, WebSocketDisconnect):
-                    print("Client websocket closed while sending TTS audio")
+                except (
+                    websockets.exceptions.ConnectionClosedError,
+                    ConnectionResetError,
+                    WebSocketDisconnect,
+                    RuntimeError,
+                ) as exc:
+                    print(f"Client websocket closed while sending TTS audio: {exc}")
                     break
 
         await asyncio.gather(sender(), receiver())
@@ -150,17 +209,115 @@ def _extract_transcript(message: ListenV1Results) -> str:
     return ""
 
 
+async def _response_pipeline(
+    connection,
+    websocket: WebSocket,
+    full_transcript: str,
+) -> None:
+    memory = memory_retrieval_node({"transcript": full_transcript})
+    semantic = memory["semantic_facts"]
+    episodic = memory["episodic_summary"]
+    token_gen = logging_llm_stream(full_transcript, semantic, episodic)
+
+    if ELEVENLABS_API_KEY:
+        await tts_stream(token_gen, websocket)
+    else:
+        async for _token in token_gen:
+            pass
+    print("Response pipeline finished")
+
+
 async def _respond_to_utterance(
     connection,
     websocket: WebSocket,
     full_transcript: str,
 ) -> None:
-    print(f"Utterance complete: {full_transcript}")
-    memory = memory_retrieval_node({"transcript": full_transcript})
-    semantic = memory["semantic_facts"]
-    episodic = memory["episodic_summary"]
-    token_gen = llm_stream(full_transcript, semantic, episodic)
-    connection.current_tts_task = asyncio.create_task(tts_stream(token_gen, websocket))
+    print(f"Sending to LLM: {full_transcript}")
+    if os.getenv("STT_ONLY", "").lower() in ("1", "true", "yes"):
+        print("(STT_ONLY set — skipping LLM/TTS)")
+        return
+
+    if connection.current_tts_task and not connection.current_tts_task.done():
+        print("Cancelling previous response (new question)")
+        connection.current_tts_task.cancel()
+        try:
+            await connection.current_tts_task
+        except asyncio.CancelledError:
+            pass
+
+    async def run_pipeline():
+        try:
+            await _response_pipeline(connection, websocket, full_transcript)
+        except asyncio.CancelledError:
+            print("Response pipeline cancelled")
+            raise
+        except Exception as exc:
+            print(f"LLM/TTS pipeline failed: {exc}")
+
+    connection.last_llm_transcript = full_transcript
+    connection.current_tts_task = asyncio.create_task(run_pipeline())
+
+
+async def _cancel_debounce_task(connection) -> None:
+    task = getattr(connection, "respond_debounce_task", None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _schedule_debounced_response(
+    connection,
+    websocket: WebSocket,
+    delay_s: float,
+) -> None:
+    """Call LLM only after `delay_s` seconds with no new audio (full question captured)."""
+
+    await _cancel_debounce_task(connection)
+
+    async def debounced():
+        while True:
+            silence = time.monotonic() - connection.last_audio_at
+            if silence >= delay_s:
+                break
+            await asyncio.sleep(0.05)
+
+        parts = list(getattr(connection, "pending_transcript_parts", []))
+        full = " ".join(parts).strip()
+        if not full:
+            return
+        if full == getattr(connection, "last_llm_transcript", None):
+            return
+
+        print(f"Debounced utterance (merged): {full}")
+        await _respond_to_utterance(connection, websocket, full)
+
+    connection.respond_debounce_task = asyncio.create_task(debounced())
+
+
+async def _flush_pending_response(connection, websocket: WebSocket) -> None:
+    await _cancel_debounce_task(connection)
+
+    parts = list(getattr(connection, "pending_transcript_parts", []))
+    full = " ".join(parts).strip()
+    connection.pending_transcript_parts = []
+    if not full:
+        return
+    if full == getattr(connection, "last_llm_transcript", None):
+        return
+
+    if connection.current_tts_task and not connection.current_tts_task.done():
+        print("Updating LLM with fuller transcript after audio ended")
+        connection.current_tts_task.cancel()
+        try:
+            await connection.current_tts_task
+        except asyncio.CancelledError:
+            pass
+
+    print(f"Flush after audio ended: {full}")
+    await _respond_to_utterance(connection, websocket, full)
 
 
 @app.websocket("/audio")
@@ -176,6 +333,7 @@ async def audio_endpoint(websocket: WebSocket):
 
     async with deepgram.listen.v1.connect(
         model="nova-3",
+        language="en",
         encoding="linear16",
         sample_rate=16000,
         channels=1,
@@ -186,6 +344,11 @@ async def audio_endpoint(websocket: WebSocket):
     ) as connection:
         connection.current_tts_task = None
         connection.utterance_buffer: List[str] = []
+        connection.pending_transcript_parts: List[str] = []
+        connection.respond_debounce_task = None
+        connection.last_llm_transcript: Optional[str] = None
+        connection.last_audio_at = time.monotonic()
+        debounce_s = float(os.getenv("UTTERANCE_DEBOUNCE_SEC", "2.5"))
         connection.on(EventType.OPEN, lambda _: print("Deepgram connection opened"))
         connection.on(EventType.CLOSE, lambda evt: print(f"Deepgram event CLOSE: {evt}"))
         connection.on(EventType.ERROR, lambda evt: print(f"Deepgram event ERROR: {evt}"))
@@ -219,7 +382,9 @@ async def audio_endpoint(websocket: WebSocket):
                 print("End of utterance but buffer empty — waiting for more segments")
                 return
 
-            await _respond_to_utterance(connection, websocket, full_transcript)
+            print(f"Utterance segment: {full_transcript}")
+            connection.pending_transcript_parts.append(full_transcript)
+            await _schedule_debounced_response(connection, websocket, debounce_s)
 
         connection.on(EventType.MESSAGE, on_message)
 
@@ -233,15 +398,11 @@ async def audio_endpoint(websocket: WebSocket):
                     print("Client websocket disconnected; finalizing Deepgram stream")
                     break
 
+                connection.last_audio_at = time.monotonic()
                 print(f"Received audio bytes from client: {len(audio_bytes)} bytes")
 
-                if connection.current_tts_task and not connection.current_tts_task.done():
-                    print("Cancelling current TTS task due to new audio (barge-in)")
-                    connection.current_tts_task.cancel()
-                    try:
-                        await connection.current_tts_task
-                    except asyncio.CancelledError:
-                        pass
+                if connection.pending_transcript_parts:
+                    await _schedule_debounced_response(connection, websocket, debounce_s)
 
                 try:
                     await connection.send_media(audio_bytes)
@@ -271,8 +432,16 @@ async def audio_endpoint(websocket: WebSocket):
             except asyncio.CancelledError:
                 pass
 
+            await _flush_pending_response(connection, websocket)
+
             if connection.current_tts_task and not connection.current_tts_task.done():
-                connection.current_tts_task.cancel()
+                try:
+                    await asyncio.wait_for(connection.current_tts_task, timeout=90.0)
+                except asyncio.TimeoutError:
+                    print("LLM/TTS still running after 90s; cancelling")
+                    connection.current_tts_task.cancel()
+                except asyncio.CancelledError:
+                    pass
             try:
                 await websocket.close()
             except Exception:
