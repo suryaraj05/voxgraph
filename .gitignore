@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local test logs
+server_log.txt
+stt_test_log.txt
+stt_test_log.txt.err
+test_server_out.txt
+test_server_err.txt
+last_response.wav
+last_response.mp3
+response_tts.wav
+response_tts.mp3
