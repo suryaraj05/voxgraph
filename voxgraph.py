@@ -1,8 +1,11 @@
 import asyncio
+import base64
 import json
 import os
 import ssl
 import time
+import wave
+from pathlib import Path
 from typing import List, Optional
 
 import logging
@@ -38,9 +41,14 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # Adam voice
 
+# ElevenLabs stream-input returns JSON with base64 audio (not raw bytes).
+# pcm_24000 is best for live playback; mp3_44100_128 works for .mp3 files.
+ELEVENLABS_OUTPUT_FORMAT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000")
+TTS_SAMPLE_RATE = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
+
 ELEVENLABS_URL = (
     f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input"
-    f"?model_id=eleven_multilingual_v2"
+    f"?model_id=eleven_multilingual_v2&output_format={ELEVENLABS_OUTPUT_FORMAT}"
 )
 
 # -------------------- LangGraph State --------------------
@@ -149,6 +157,34 @@ logging.basicConfig(level=logging.INFO)
 # Keep websockets quiet so transcript logs are readable
 logging.getLogger("websockets").setLevel(logging.WARNING)
 
+def _parse_elevenlabs_audio(message) -> Optional[bytes]:
+    """Decode ElevenLabs stream-input JSON messages (base64 audio field)."""
+    if isinstance(message, (bytes, bytearray, memoryview)):
+        raw = bytes(message) if isinstance(message, memoryview) else message
+        try:
+            message = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw
+    if not isinstance(message, str):
+        return None
+    try:
+        data = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    audio_b64 = data.get("audio")
+    if not audio_b64:
+        return None
+    return base64.b64decode(audio_b64)
+
+
+def _save_tts_wav(path: Path, pcm_s16le: bytes, sample_rate: int) -> None:
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_s16le)
+
+
 async def tts_stream(token_stream, client_websocket: WebSocket):
     if not ELEVENLABS_API_KEY:
         print("ELEVENLABS_API_KEY not set — skipping TTS, LLM text only")
@@ -157,11 +193,12 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
         return
 
     headers = {"xi-api-key": ELEVENLABS_API_KEY}
+    tts_chunks: List[bytes] = []
+
     async with websockets.connect(ELEVENLABS_URL, additional_headers=headers) as ws:
-        # Initialize stream
         await ws.send(json.dumps({
             "text": " ",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
         }))
 
         async def sender():
@@ -171,14 +208,15 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
                 except Exception:
                     print("Sending token to TTS: <unprintable>")
                 await ws.send(json.dumps({"text": token}))
-            await ws.send(json.dumps({"text": ""}))  # end signal
+            await ws.send(json.dumps({"text": ""}))
 
         async def receiver():
-            async for audio in ws:
-                try:
-                    print(f"TTS audio chunk size: {len(audio)} bytes")
-                except Exception:
-                    print("TTS audio chunk received")
+            async for message in ws:
+                audio = _parse_elevenlabs_audio(message)
+                if not audio:
+                    continue
+                tts_chunks.append(audio)
+                print(f"TTS audio chunk (live): {len(audio)} bytes")
                 try:
                     await client_websocket.send_bytes(audio)
                 except (
@@ -187,10 +225,25 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
                     WebSocketDisconnect,
                     RuntimeError,
                 ) as exc:
-                    print(f"Client websocket closed while sending TTS audio: {exc}")
+                    print(f"Client closed during live TTS stream: {exc}")
                     break
 
         await asyncio.gather(sender(), receiver())
+
+    if not tts_chunks:
+        print("WARNING: ElevenLabs returned no audio")
+        return
+
+    combined = b"".join(tts_chunks)
+    out_dir = Path(__file__).resolve().parent
+    if ELEVENLABS_OUTPUT_FORMAT.startswith("pcm"):
+        out_path = out_dir / "last_response.wav"
+        _save_tts_wav(out_path, combined, TTS_SAMPLE_RATE)
+    else:
+        out_path = out_dir / "last_response.mp3"
+        out_path.write_bytes(combined)
+    print(f"Saved TTS -> {out_path} ({len(combined)} bytes)")
+    print(f"Play with: start {out_path}")
 
 # -------------------- FastAPI Endpoint --------------------
 app = FastAPI()
@@ -297,6 +350,19 @@ async def _schedule_debounced_response(
     connection.respond_debounce_task = asyncio.create_task(debounced())
 
 
+async def _deepgram_keepalive_loop(connection, stop: asyncio.Event) -> None:
+    """Deepgram closes if no audio/text arrives for ~10s; keep alive during LLM+TTS."""
+    while not stop.is_set():
+        try:
+            await connection.send_keep_alive()
+        except Exception:
+            break
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _flush_pending_response(connection, websocket: WebSocket) -> None:
     await _cancel_debounce_task(connection)
 
@@ -389,6 +455,10 @@ async def audio_endpoint(websocket: WebSocket):
         connection.on(EventType.MESSAGE, on_message)
 
         listen_task = asyncio.create_task(connection.start_listening())
+        keepalive_stop = asyncio.Event()
+        keepalive_task = asyncio.create_task(
+            _deepgram_keepalive_loop(connection, keepalive_stop)
+        )
 
         try:
             while True:
@@ -413,6 +483,13 @@ async def audio_endpoint(websocket: WebSocket):
         except Exception as exc:
             print(f"Unhandled audio_endpoint error: {exc}")
         finally:
+            keepalive_stop.set()
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
             try:
                 await connection.send_finalize()
                 await connection.send_close_stream()
