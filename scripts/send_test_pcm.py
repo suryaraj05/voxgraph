@@ -24,17 +24,33 @@ def _try_import_sounddevice():
         return None, None
 
 
-async def receive_tts_live(ws, out_wav: Path, max_wait_s: float, live_play: bool) -> int:
+async def receive_tts_live(
+    ws,
+    out_wav: Path,
+    max_wait_s: float,
+    live_play: bool,
+    *,
+    idle_timeout_s: float = 5.0,
+    low_latency: bool = False,
+    min_listen_s: float = 0.0,
+) -> int:
     sd, np = _try_import_sounddevice()
     chunks: list[bytes] = []
     idle_seconds = 0
-    deadline = time.monotonic() + max_wait_s
+    started = time.monotonic()
+    deadline = started + max_wait_s
     audio_stream = None
 
     if live_play and sd is not None:
-        audio_stream = sd.OutputStream(
-            samplerate=TTS_SAMPLE_RATE, channels=1, dtype="int16"
-        )
+        out_kwargs: dict = {
+            "samplerate": TTS_SAMPLE_RATE,
+            "channels": 1,
+            "dtype": "int16",
+        }
+        if low_latency:
+            out_kwargs["latency"] = "low"
+            out_kwargs["blocksize"] = 512
+        audio_stream = sd.OutputStream(**out_kwargs)
         audio_stream.start()
         print(f"Live playback on ({TTS_SAMPLE_RATE} Hz PCM)...")
     elif live_play:
@@ -47,10 +63,18 @@ async def receive_tts_live(ws, out_wav: Path, max_wait_s: float, live_play: bool
             msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
         except asyncio.TimeoutError:
             idle_seconds += 1
-            if chunks and idle_seconds >= 5:
+            elapsed = time.monotonic() - started
+            if (
+                chunks
+                and idle_seconds >= idle_timeout_s
+                and elapsed >= min_listen_s
+            ):
                 break
+            if not chunks and elapsed >= 5.0 and int(elapsed) % 5 == 0:
+                print(f"  Still waiting for TTS... ({elapsed:.0f}s)")
             continue
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as exc:
+            print(f"  WebSocket closed by server: {exc}")
             break
 
         idle_seconds = 0

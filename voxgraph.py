@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import logging
+import traceback
 import websockets
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -21,7 +22,35 @@ from google.genai import client as genai_client
 import uvicorn
 
 from dotenv import load_dotenv
-load_dotenv()  # loads variables from .env into os.environ
+
+from memory_store import MemoryStore
+
+# override=True so .env wins over a stale $env:STT_ONLY=1 in the terminal
+load_dotenv(override=True)
+DEFAULT_USER_ID = "default"
+memory_store = MemoryStore()
+
+
+def _stt_only_mode() -> bool:
+    return os.getenv("STT_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+
+def _demo_mode() -> bool:
+    return os.getenv("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _debounce_sec() -> float:
+    raw = os.getenv("UTTERANCE_DEBOUNCE_SEC", "").strip()
+    if raw:
+        return float(raw)
+    return 0.6 if _demo_mode() else 2.5
+
+
+def _deepgram_endpointing_ms() -> int:
+    raw = os.getenv("DEEPGRAM_ENDPOINTING_MS", "").strip()
+    if raw:
+        return int(raw)
+    return 150 if _demo_mode() else 300
 
 # -------------------- Configuration --------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -66,9 +95,8 @@ class VoxGraphState(TypedDict):
 
 # -------------------- LangGraph Nodes --------------------
 def memory_retrieval_node(state: VoxGraphState):
-    # TODO: replace with real database/vector store
-    semantic_facts = ["user prefers morning flights", "vegetarian"]
-    episodic_summary = "last conversation was about booking a flight to Mumbai"
+    semantic_facts = memory_store.get_facts(DEFAULT_USER_ID)
+    episodic_summary = memory_store.get_episodic_summary(DEFAULT_USER_ID)
     return {
         "semantic_facts": semantic_facts,
         "episodic_summary": episodic_summary
@@ -88,6 +116,14 @@ User said: {state['transcript']}
     llm_response = response.text
     needs_tool = False  # implement tool calling later
     return {"llm_response": llm_response, "needs_tool": needs_tool}
+
+
+# -------------------- Update Memory --------------------
+
+async def update_memory(transcript: str, llm_response: str):
+    old_summary = memory_store.get_episodic_summary(DEFAULT_USER_ID)
+    new_summary = f"{old_summary}\nUser: {transcript}\nAI: {llm_response}"
+    memory_store.update_episodic_summary(DEFAULT_USER_ID, new_summary[-500:])
 
 # -------------------- Streaming LLM (yields tokens) --------------------
 def _gemini_models_to_try() -> List[str]:
@@ -119,7 +155,7 @@ You are VoxGraph, a voice AI assistant.
 User Transcript: {transcript}
 Semantic Facts: {semantic_facts}
 Episodic Summary: {episodic_summary}
-Reply in one or two short sentences suitable for voice output.
+Reply in {"ONE short sentence" if _demo_mode() else "one or two short sentences"} suitable for voice output.
 """
     last_error: Optional[Exception] = None
     for model in _gemini_models_to_try():
@@ -143,13 +179,16 @@ Reply in one or two short sentences suitable for voice output.
 
 async def logging_llm_stream(transcript: str, semantic_facts: List[str], episodic_summary: str):
     """Wrapper around `llm_stream` that logs each token as it is produced."""
+    quiet = _demo_mode()
     async for token in llm_stream(transcript, semantic_facts, episodic_summary):
-        try:
-            print(f"LLM token: {token}")
-        except Exception:
-            print("LLM token: <unprintable>")
+        if not quiet:
+            try:
+                print(f"LLM token: {token}")
+            except Exception:
+                print("LLM token: <unprintable>")
         yield token
-    print("LLM stream completed")
+    if not quiet:
+        print("LLM stream completed")
 
 # -------------------- TTS Streaming (ElevenLabs) --------------------
 
@@ -185,28 +224,52 @@ def _save_tts_wav(path: Path, pcm_s16le: bytes, sample_rate: int) -> None:
         wf.writeframes(pcm_s16le)
 
 
-async def tts_stream(token_stream, client_websocket: WebSocket):
+async def tts_stream(token_stream, client_websocket: WebSocket) -> str:
     if not ELEVENLABS_API_KEY:
         print("ELEVENLABS_API_KEY not set — skipping TTS, LLM text only")
-        async for _token in token_stream:
-            pass
-        return
+        llm_text_parts_no_key: list[str] = []
+        async for token in token_stream:
+            llm_text_parts_no_key.append(token)
+            
+        return "".join(llm_text_parts_no_key)
 
     headers = {"xi-api-key": ELEVENLABS_API_KEY}
     tts_chunks: List[bytes] = []
+    quiet = _demo_mode()
+    token_q: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=512)
+    llm_text_parts: list[str] = []
 
-    async with websockets.connect(ELEVENLABS_URL, additional_headers=headers) as ws:
+    async def llm_to_queue() -> None:
+        try:
+            async for token in token_stream:
+                llm_text_parts.append(token)
+                await token_q.put(token)
+        finally:
+            await token_q.put(None)
+
+    # Run Gemini while ElevenLabs WebSocket connects (cuts time-to-first-audio)
+    llm_task = asyncio.create_task(llm_to_queue())
+
+    async with websockets.connect(
+        ELEVENLABS_URL,
+        additional_headers=headers,
+        open_timeout=30,
+    ) as ws:
         await ws.send(json.dumps({
             "text": " ",
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
         }))
 
         async def sender():
-            async for token in token_stream:
-                try:
-                    print(f"Sending token to TTS: {token}")
-                except Exception:
-                    print("Sending token to TTS: <unprintable>")
+            while True:
+                token = await token_q.get()
+                if token is None:
+                    break
+                if not quiet:
+                    try:
+                        print(f"Sending token to TTS: {token}")
+                    except Exception:
+                        print("Sending token to TTS: <unprintable>")
                 await ws.send(json.dumps({"text": token}))
             await ws.send(json.dumps({"text": ""}))
 
@@ -216,9 +279,12 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
                 if not audio:
                     continue
                 tts_chunks.append(audio)
-                print(f"TTS audio chunk (live): {len(audio)} bytes")
+                if not quiet:
+                    print(f"TTS audio chunk (live): {len(audio)} bytes")
                 try:
                     await client_websocket.send_bytes(audio)
+                    if not quiet and len(tts_chunks) == 1:
+                        print("First TTS chunk sent to client", flush=True)
                 except (
                     websockets.exceptions.ConnectionClosedError,
                     ConnectionResetError,
@@ -229,10 +295,13 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
                     break
 
         await asyncio.gather(sender(), receiver())
+        await llm_task
+
+        full_llm_text =  "".join(llm_text_parts)
 
     if not tts_chunks:
         print("WARNING: ElevenLabs returned no audio")
-        return
+        return full_llm_text
 
     combined = b"".join(tts_chunks)
     out_dir = Path(__file__).resolve().parent
@@ -244,6 +313,8 @@ async def tts_stream(token_stream, client_websocket: WebSocket):
         out_path.write_bytes(combined)
     print(f"Saved TTS -> {out_path} ({len(combined)} bytes)")
     print(f"Play with: start {out_path}")
+
+    return full_llm_text
 
 # -------------------- FastAPI Endpoint --------------------
 app = FastAPI()
@@ -271,13 +342,19 @@ async def _response_pipeline(
     semantic = memory["semantic_facts"]
     episodic = memory["episodic_summary"]
     token_gen = logging_llm_stream(full_transcript, semantic, episodic)
-
+    full_response: str
     if ELEVENLABS_API_KEY:
-        await tts_stream(token_gen, websocket)
+        full_response = await tts_stream(token_gen, websocket)
+        if full_response.strip():
+            await update_memory(full_transcript, full_response)
     else:
-        async for _token in token_gen:
-            pass
-    print("Response pipeline finished")
+        parts: list[str] = []
+        async for token in token_gen:
+            parts.append(token)
+        full_response = "".join(parts)
+        if full_response.strip():
+            await update_memory(full_transcript, full_response)
+    print("Response pipeline finished", flush=True)
 
 
 async def _respond_to_utterance(
@@ -285,8 +362,8 @@ async def _respond_to_utterance(
     websocket: WebSocket,
     full_transcript: str,
 ) -> None:
-    print(f"Sending to LLM: {full_transcript}")
-    if os.getenv("STT_ONLY", "").lower() in ("1", "true", "yes"):
+    print(f"Sending to LLM: {full_transcript}", flush=True)
+    if _stt_only_mode():
         print("(STT_ONLY set — skipping LLM/TTS)")
         return
 
@@ -306,6 +383,7 @@ async def _respond_to_utterance(
             raise
         except Exception as exc:
             print(f"LLM/TTS pipeline failed: {exc}")
+            traceback.print_exc()
 
     connection.last_llm_transcript = full_transcript
     connection.current_tts_task = asyncio.create_task(run_pipeline())
@@ -339,12 +417,21 @@ async def _schedule_debounced_response(
 
         parts = list(getattr(connection, "pending_transcript_parts", []))
         full = " ".join(parts).strip()
+        # Fallback: some turns may never emit final segments; use latest interim
+        # after silence so the LLM/TTS path still progresses.
+        if not full:
+            full = (getattr(connection, "last_interim_transcript", "") or "").strip()
         if not full:
             return
         if full == getattr(connection, "last_llm_transcript", None):
+            # Drop already-consumed segments so they do not leak into next turn.
+            connection.pending_transcript_parts = []
             return
 
         print(f"Debounced utterance (merged): {full}")
+        # Consume this turn's pending transcript before starting LLM/TTS.
+        connection.pending_transcript_parts = []
+        connection.last_interim_transcript = ""
         await _respond_to_utterance(connection, websocket, full)
 
     connection.respond_debounce_task = asyncio.create_task(debounced())
@@ -370,7 +457,10 @@ async def _flush_pending_response(connection, websocket: WebSocket) -> None:
     full = " ".join(parts).strip()
     connection.pending_transcript_parts = []
     if not full:
-        return
+        full = (getattr(connection, "last_interim_transcript", "") or "").strip()
+        if not full:
+            return
+    connection.last_interim_transcript = ""
     if full == getattr(connection, "last_llm_transcript", None):
         return
 
@@ -404,17 +494,18 @@ async def audio_endpoint(websocket: WebSocket):
         sample_rate=16000,
         channels=1,
         interim_results=True,
-        endpointing=300,
+        endpointing=_deepgram_endpointing_ms(),
         punctuate=True,
         smart_format=True,
     ) as connection:
         connection.current_tts_task = None
         connection.utterance_buffer: List[str] = []
         connection.pending_transcript_parts: List[str] = []
+        connection.last_interim_transcript = ""
         connection.respond_debounce_task = None
         connection.last_llm_transcript: Optional[str] = None
         connection.last_audio_at = time.monotonic()
-        debounce_s = float(os.getenv("UTTERANCE_DEBOUNCE_SEC", "2.5"))
+        debounce_s = _debounce_sec()
         connection.on(EventType.OPEN, lambda _: print("Deepgram connection opened"))
         connection.on(EventType.CLOSE, lambda evt: print(f"Deepgram event CLOSE: {evt}"))
         connection.on(EventType.ERROR, lambda evt: print(f"Deepgram event ERROR: {evt}"))
@@ -433,10 +524,13 @@ async def audio_endpoint(websocket: WebSocket):
             )
 
             if not message.is_final:
+                if transcript:
+                    connection.last_interim_transcript = transcript
                 return
 
             if transcript:
                 connection.utterance_buffer.append(transcript)
+                connection.last_interim_transcript = transcript
 
             end_of_utterance = message.speech_final or getattr(message, "from_finalize", False)
             if not end_of_utterance:
@@ -448,7 +542,7 @@ async def audio_endpoint(websocket: WebSocket):
                 print("End of utterance but buffer empty — waiting for more segments")
                 return
 
-            print(f"Utterance segment: {full_transcript}")
+            print(f"Utterance segment: {full_transcript}", flush=True)
             connection.pending_transcript_parts.append(full_transcript)
             await _schedule_debounced_response(connection, websocket, debounce_s)
 
@@ -469,9 +563,10 @@ async def audio_endpoint(websocket: WebSocket):
                     break
 
                 connection.last_audio_at = time.monotonic()
-                print(f"Received audio bytes from client: {len(audio_bytes)} bytes")
+                if not _demo_mode():
+                    print(f"Received audio bytes from client: {len(audio_bytes)} bytes")
 
-                if connection.pending_transcript_parts:
+                if connection.pending_transcript_parts or connection.last_interim_transcript:
                     await _schedule_debounced_response(connection, websocket, debounce_s)
 
                 try:
@@ -526,4 +621,10 @@ async def audio_endpoint(websocket: WebSocket):
 
 # -------------------- Run Server --------------------
 if __name__ == "__main__":
+    mode = "STT only" if _stt_only_mode() else "full pipeline (STT + LLM + TTS)"
+    demo = " | DEMO_MODE (low latency)" if _demo_mode() else ""
+    print(
+        f"VoxGraph starting — {mode}{demo} | "
+        f"debounce={_debounce_sec()}s endpointing={_deepgram_endpointing_ms()}ms"
+    )
     uvicorn.run(app, host="0.0.0.0", port=8000)
